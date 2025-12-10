@@ -38,8 +38,7 @@ if not OPENAI_API_KEY or not SLACK_BOT_TOKEN or not SLACK_APP_TOKEN:
 
 app = AsyncApp(token=SLACK_BOT_TOKEN)
 
-# Global supervisor and Codon workload graph
-supervisor = None
+# Global Codon workload graph
 codon_workload = None
 
 # --------------------------------------------------------------------
@@ -338,9 +337,6 @@ async def main():
             tags=["langgraph", "codon", "recycling"],
             compile_kwargs={"checkpointer": MemorySaver()},
         )
-
-        # This is the compiled LangGraph graph can use in Slack
-        supervisor = codon_workload.langgraph_compiled_graph
 
         #Start Slack
         handler = AsyncSocketModeHandler(app, SLACK_APP_TOKEN)
