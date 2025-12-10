@@ -11,6 +11,7 @@ from langchain_mcp_adapters.tools import load_mcp_tools
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langgraph.prebuilt import create_react_agent
 from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import MessagesState
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import convert_to_messages
 
