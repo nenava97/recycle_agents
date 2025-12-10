@@ -8,8 +8,9 @@ from langgraph.checkpoint.memory import MemorySaver
 
 from fastmcp import Client
 from langchain_mcp_adapters.tools import load_mcp_tools
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langgraph.prebuilt import create_react_agent
-from langgraph_supervisor import create_supervisor
+from langgraph.graph import StateGraph, START, END
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import convert_to_messages
 
@@ -107,8 +108,16 @@ def build_locator_agent(all_tools):
             "- You will ONLY use the MCP tools geolocate_ip() and get_places(query, latitude, longitude).\n"
             "- You MUST retrieve the IP, latitude, and longitude FIRST using geolocate_ip().\n"
             "- ONLY after you have retrieved the latitude and longitude will you use get_places(query, latitude, longitude).\n"
-            "- After you're done with your tasks, respond to the supervisor directly.\n"
-            "- Respond ONLY with the results of your work, do NOT include ANY other text."
+            "- Carefully read the ToolMessage content from get_places. If it contains an 'error' field "
+            "  or the 'results' list is empty, DO NOT just say there are no locations.\n"
+            "- In that case, explicitly say you attempted to look up nearby recycling centers but there is "
+            "  a temporary technical issue with the external database (such as a 403 error), and suggest that "
+            "  the user try again later or use a map service like Google Maps.\n"
+            "- ALWAYS state the city/region you inferred (e.g., Queens, New York).\n"
+            "- ALWAYS remind the user that improper disposal of e-waste can result in fines and that proper "
+            "  recycling is important.\n"
+            "- After you're done with your tasks, respond with a clear, user-facing explanation of what you found "
+            "  (or why you couldn't find locations).\n"
         ),
         name="locator_agent",
     )
@@ -139,6 +148,8 @@ def build_research_agent(all_tools):
             "- If the knowledge base is insufficient, you MAY also use the web_search(query: str)\n"
             "  tool for additional context.\n"
             "- Do NOT use any other tool.\n"
+            "- If the user's question is not about waste disposal or recycling, "
+            "  clearly state that you cannot answer it because you are a waste management agent.\n"
             "- After you're done with your tasks, respond to the supervisor directly.\n"
             "- Respond ONLY with the results of your work, do NOT include ANY other text."
         ),
@@ -151,14 +162,14 @@ def build_research_agent(all_tools):
 # --------------------------------------------------------------------
 @app.event("app_mention")
 async def handle_query(body, say):
-    global supervisor, codon_workload
+    global codon_workload
 
     event = body["event"]
     message = event["text"]
     thread_ts = event.get("thread_ts", event["ts"])
 
     # Make sure the workload is ready
-    if supervisor is None or codon_workload is None:
+    if codon_workload is None:
         await say(
             text="Bot is still starting, please try again.",
             thread_ts=thread_ts,
@@ -184,15 +195,79 @@ async def handle_query(body, say):
                 }
             },
         )
-        # Extract the final state from the report
-        # (this depends on the root node name; if unsure, print report.node_results.keys())
-        final_state = report.final_state
-        answer = final_state["messages"][-1].content
+        # Now we read from the finalizer node
+        finalizer_results = report.node_results("finalizer")
+        if not finalizer_results:
+            raise RuntimeError("No 'finalizer' node results found in Codon report")
+
+        last_payload = finalizer_results[-1]
+        
+        print("\n===== CODON LAST PAYLOAD FROM finalizer =====")
+        try:
+            print("Raw last_payload repr:", repr(last_payload))
+
+            if isinstance(last_payload, dict):
+                state = last_payload.get("state", last_payload)
+            else:
+                state = getattr(last_payload, "state", {}) or {}
+
+            print("State repr:", repr(state))
+        except Exception as debug_err:
+            print("DEBUG PRINT FAILED:", debug_err)
+        print("===== END CODON FINALIZER PAYLOAD =====\n")
+
+                # Extract state from last_payload
+        if isinstance(last_payload, dict):
+            state = last_payload.get("state", last_payload)
+        else:
+            state = getattr(last_payload, "state", {}) or {}
+
+        # --- DEBUG (optional, keep if useful) ---
+        print("\n===== CODON LAST PAYLOAD FROM finalizer =====")
+        print("State repr:", repr(state))
+        print("===== END CODON FINALIZER PAYLOAD =====\n")
+        # ----------------------------------------
+
+        answer = None
+
+        # 1) If the state has a messages list, use that (some graph setups do this)
+        messages = state.get("messages") or state.get("output_messages")
+        if messages:
+            last_msg = messages[-1]
+            if hasattr(last_msg, "content"):
+                answer = last_msg.content
+            elif isinstance(last_msg, dict):
+                answer = last_msg.get("content", "")
+            else:
+                answer = str(last_msg)
+
+        # 2) Otherwise, check for the 'value' key (your current shape)
+        if answer is None and "value" in state:
+            msg = state["value"]
+            if hasattr(msg, "content"):
+                answer = msg.content
+            else:
+                answer = str(msg)
+
+        # 3) Fallback if we still couldn't find anything
+        if answer is None:
+            print("WARNING: finalizer state had no usable messages. Full state:", repr(state))
+            answer = (
+                "Sorry, I couldn't construct a complete response this time. "
+                "Please try asking your recycling question again."
+            )
 
     except Exception as e:
         import traceback
         traceback.print_exc()
-        answer = f"Internal error: {type(e).__name__}: {e}"
+        cause = getattr(e, "__cause__", None)
+        if cause is not None:
+            answer = (
+                f"Internal error: {type(e).__name__}: {e} "
+                f"(root cause: {type(cause).__name__}: {cause})"
+            )
+        else:
+            answer = f"Internal error: {type(e).__name__}: {e}"
 
     await say(answer, thread_ts=thread_ts)
 
@@ -200,46 +275,59 @@ async def handle_query(body, say):
 # Main: start MCP client, build agents, build supervisor graph, start Slack
 # --------------------------------------------------------------------
 async def main():
-    global supervisor, codon_workload
+    global codon_workload
 
     # Connect to MCP server once, load tools once
     async with Client("http://localhost:8000/mcp") as recycle_mcp:
         all_tools = await load_mcp_tools(recycle_mcp.session)
         locator_agent = build_locator_agent(all_tools)
         research_agent = build_research_agent(all_tools)
-
-        # LangGraph multi-agent supervisor
-        supervisor_graph = create_supervisor(
-            model=init_chat_model("openai:gpt-4.1-mini"),
-            agents=[research_agent, locator_agent],
-            prompt=(
-                "You are a supervisor managing two agents regarding waste disposal.\n"
-                "Users should only ask about how to dispose of waste material.\n"
-                "IF the user asks a question that is not related to waste disposal, "
-                "kindly inform them that you cannot answer the question as you are a waste management agent.\n"
-                "IF the user queries anything that is not related to waste disposal or recycling, "
-                "you will be terminated and fired.\n\n"
-                "Agents:\n"
-                "- research_agent: Assign research-related tasks to this agent, "
-                "  such as more information on city guidelines.\n"
-                "- locator_agent: Assign locating-related tasks to this agent, "
-                "  such as finding places near a specific area.\n\n"
-                "Policy:\n"
-                "- Assign work to one agent at a time; do NOT call agents in parallel.\n"
-                "- You should use the research agent to inform yourself on the appropriate guidelines\n"
-                "  and then use the locator agent to give five locations for the user.\n"
-                "- IF the object is recyclable, provide recycling centers nearby "
-                "  (paper, plastic, aluminium, cardboard, etc.).\n"
-                "- You MUST find 5 locations to give to the user when possible.\n"
-                "- If you hit the recursion limit, inform the user that you cannot answer the question for now "
-                "  and to ask again later.\n"
-                "- You must also inform the user of any fines they could incur if they do not follow the guidelines.\n"
-                "- DO NOT respond with a question.\n"
-                "- Do not do any work yourself; delegate to the agents."
-            ),
-            add_handoff_back_messages=True,
-            output_mode="full_history",
+        
+        # Finalizer node: composes the final answer
+        finalizer_prompt = ChatPromptTemplate.from_messages(
+            [
+                (
+                    "system",
+                    (
+                        "You are the final waste-disposal assistant.\n"
+                        "You are given the full conversation so far, which includes:\n"
+                        "- The user’s question about waste disposal or recycling.\n"
+                        "- A research agent’s explanation, including regulations and best practices.\n"
+                        "- A locator agent’s attempt to find nearby recycling centers (including ToolMessages "
+                        "  from geolocate_ip and get_places with possible errors).\n\n"
+                        "Your job is to produce ONE final answer to the user that:\n"
+                        "- Clearly explains whether the item can be recycled, and how.\n"
+                        "- Summarizes any relevant local guidance or regulations.\n"
+                        "- If the locator agent found locations, list up to 5 centers with city/region details.\n"
+                        "- If the locator agent encountered an error (such as a 403 from Google Places) or no results,\n"
+                        "  explicitly say you attempted to look up nearby locations but there was a temporary technical issue,\n"
+                        "  and suggest using a map service like Google Maps or the city website as a fallback.\n"
+                        "- ALWAYS mention that improper disposal (especially of e-waste) can result in fines and that proper\n"
+                        "  recycling is important.\n"
+                        "- Be concise but helpful. Do NOT talk about internal tools or agents, only address the user.\n"
+                    ),
+                ),
+                MessagesPlaceholder("messages"),
+            ]
         )
+
+        finalizer_chain = finalizer_prompt | init_chat_model("openai:gpt-4.1-mini")
+
+        # Build a *StateGraph* instead of using langgraph_supervisor
+        #    This graph:
+        #      START -> research_agent -> locator_agent -> END
+        graph_builder = StateGraph(MessagesState)
+
+        graph_builder.add_node("research_agent", research_agent)
+        graph_builder.add_node("locator_agent", locator_agent)
+        graph_builder.add_node("finalizer", finalizer_chain)
+
+        graph_builder.add_edge(START, "research_agent")
+        graph_builder.add_edge("research_agent", "locator_agent")
+        graph_builder.add_edge("locator_agent", "finalizer")
+        graph_builder.add_edge("finalizer", END)
+
+        supervisor_graph = graph_builder  # <-- StateGraph (pre-compiled), as Codon expects.
         
         # Wrap graph with Codon’s LangGraphWorkloadAdapter
         codon_workload = LangGraphWorkloadAdapter.from_langgraph(
@@ -250,21 +338,6 @@ async def main():
             tags=["langgraph", "codon", "recycling"],
             compile_kwargs={"checkpointer": MemorySaver()},
         )
-        
-        # # --- Codon probe: run a single test workload execution ---
-        # # This is synchronous; it's fine to run once at startup.
-        # test_report = codon_workload.execute(
-        #     {
-        #         "state": {
-        #             "messages": [
-        #                 {"role": "user", "content": "Test telemetry from Codon."}
-        #             ]
-        #         }
-        #     },
-        #     deployment_id="dev-slack-probe",
-        # )
-        # print("Codon probe ledger length:", len(test_report.ledger))
-        # # --- end probe ---
 
         # This is the compiled LangGraph graph can use in Slack
         supervisor = codon_workload.langgraph_compiled_graph
